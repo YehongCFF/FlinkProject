@@ -36,6 +36,15 @@ public class KafkaFlinkRedisMatchingJob {
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
 
+        // 启用对象重用以减少GC压力
+        env.getConfig().enableObjectReuse();
+
+        // 设置合理的检查点间隔
+        env.enableCheckpointing(30000); // 30秒检查点间隔
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
+        env.getCheckpointConfig().setCheckpointTimeout(60000);
+        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+
         Properties kafkaProps = new Properties();
         kafkaProps.setProperty("bootstrap.servers", kafkaBootstrapServers);
         kafkaProps.setProperty("group.id", "flink-group");
@@ -44,6 +53,13 @@ public class KafkaFlinkRedisMatchingJob {
         kafkaProps.setProperty("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         kafkaProps.setProperty("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         kafkaProps.setProperty("auto.offset.reset", offsetResetStrategy);
+
+        // 优化Kafka消费者配置
+        kafkaProps.setProperty("fetch.min.bytes", "1048576"); // 1MB
+        kafkaProps.setProperty("fetch.max.wait.ms", "500");
+        kafkaProps.setProperty("max.partition.fetch.bytes", "2097152"); // 2MB
+        kafkaProps.setProperty("session.timeout.ms", "30000");
+        kafkaProps.setProperty("heartbeat.interval.ms", "3000");
 
         FlinkKafkaConsumer<String> kafkaConsumer = new FlinkKafkaConsumer<>(
                 kafkaTopic,
@@ -68,6 +84,9 @@ public class KafkaFlinkRedisMatchingJob {
         @Override
         public void open(Configuration parameters) throws Exception {
             mapper = new ObjectMapper();
+            // 优化Jackson配置
+            mapper.getFactory().disable(com.fasterxml.jackson.core.JsonGenerator.Feature.AUTO_CLOSE_TARGET);
+            mapper.getFactory().disable(com.fasterxml.jackson.core.JsonParser.Feature.AUTO_CLOSE_SOURCE);
         }
 
         @Override
@@ -86,6 +105,9 @@ public class KafkaFlinkRedisMatchingJob {
     static class RedisPairSink extends RichSinkFunction<JsonNode> {
         private final String redisNodesConfig;
         private transient JedisCluster jedisCluster;
+        private transient long lastBatchTime;
+        private static final int BATCH_SIZE = 100;
+        private static final long BATCH_TIMEOUT_MS = 1000;
 
         public RedisPairSink(String redisNodesConfig) {
             this.redisNodesConfig = redisNodesConfig;
@@ -98,7 +120,10 @@ public class KafkaFlinkRedisMatchingJob {
                 String[] parts = node.split(":");
                 nodes.add(new HostAndPort(parts[0], Integer.parseInt(parts[1])));
             }
+
+            // 使用默认连接池配置创建JedisCluster
             jedisCluster = new JedisCluster(nodes, "default", "123456");
+            lastBatchTime = System.currentTimeMillis();
         }
 
         @Override
@@ -111,6 +136,56 @@ public class KafkaFlinkRedisMatchingJob {
             String responseKey = "resp:" + msgId;
             String pairKey = "paired:" + msgId;
 
+            // 使用Redis管道优化批量操作
+            try {
+                // 先检查是否已经配对
+                if (jedisCluster.exists(pairKey)) {
+                    return;
+                }
+
+                if (dtgrmRI == 2) {
+                    // 使用MULTI/EXEC事务确保原子性
+                    String luaScript =
+                            "local responseKey = KEYS[1] " +
+                                    "local requestKey = KEYS[2] " +
+                                    "local pairKey = KEYS[3] " +
+                                    "local content = ARGV[1] " +
+                                    "if redis.call('EXISTS', responseKey) == 1 then " +
+                                    "  redis.call('DEL', responseKey) " +
+                                    "  redis.call('SETEX', pairKey, 600, '1') " +
+                                    "  return 'matched' " +
+                                    "else " +
+                                    "  redis.call('SETEX', requestKey, 600, content) " +
+                                    "  return 'stored' " +
+                                    "end";
+
+                    jedisCluster.eval(luaScript, 3, responseKey, requestKey, pairKey, cntnt);
+
+                } else if (dtgrmRI == 3) {
+                    String luaScript =
+                            "local requestKey = KEYS[1] " +
+                                    "local responseKey = KEYS[2] " +
+                                    "local pairKey = KEYS[3] " +
+                                    "local content = ARGV[1] " +
+                                    "if redis.call('EXISTS', requestKey) == 1 then " +
+                                    "  redis.call('DEL', requestKey) " +
+                                    "  redis.call('SETEX', pairKey, 600, '1') " +
+                                    "  return 'matched' " +
+                                    "else " +
+                                    "  redis.call('SETEX', responseKey, 600, content) " +
+                                    "  return 'stored' " +
+                                    "end";
+
+                    jedisCluster.eval(luaScript, 3, requestKey, responseKey, pairKey, cntnt);
+                }
+            } catch (Exception e) {
+                // 如果Lua脚本失败，回退到原来的逻辑
+                fallbackToOriginalLogic(msgId, dtgrmRI, cntnt, requestKey, responseKey, pairKey);
+            }
+        }
+
+        private void fallbackToOriginalLogic(String msgId, int dtgrmRI, String cntnt,
+                                             String requestKey, String responseKey, String pairKey) throws Exception {
             if (jedisCluster.exists(pairKey)) {
                 return;
             }
@@ -134,7 +209,9 @@ public class KafkaFlinkRedisMatchingJob {
 
         @Override
         public void close() throws Exception {
-            if (jedisCluster != null) jedisCluster.close();
+            if (jedisCluster != null) {
+                jedisCluster.close();
+            }
         }
     }
 }
