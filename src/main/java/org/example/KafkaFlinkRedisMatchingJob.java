@@ -38,7 +38,7 @@ public class KafkaFlinkRedisMatchingJob {
 
         // 启用对象重用以减少GC压力
         env.getConfig().enableObjectReuse();
-
+        //
         // 设置合理的检查点间隔
         env.enableCheckpointing(30000); // 30秒检查点间隔
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
