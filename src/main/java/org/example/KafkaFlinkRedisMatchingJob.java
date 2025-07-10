@@ -15,10 +15,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.JsonNode;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.JedisCluster;
+import redis.clients.jedis.JedisPoolConfig;
+import redis.clients.jedis.Pipeline;
 
 import java.util.HashSet;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 public class KafkaFlinkRedisMatchingJob {
 
@@ -38,7 +41,7 @@ public class KafkaFlinkRedisMatchingJob {
 
         // 启用对象重用以减少GC压力
         env.getConfig().enableObjectReuse();
-        //
+
         // 设置合理的检查点间隔
         env.enableCheckpointing(30000); // 30秒检查点间隔
         env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000);
@@ -47,7 +50,17 @@ public class KafkaFlinkRedisMatchingJob {
 
         Properties kafkaProps = new Properties();
         kafkaProps.setProperty("bootstrap.servers", kafkaBootstrapServers);
-        kafkaProps.setProperty("group.id", "flink-group");
+
+        // 使用时间戳作为consumer group ID的一部分，确保每次都是新的consumer group
+        String consumerGroupId = "flink-group-" + System.currentTimeMillis();
+        if ("earliest".equals(offsetResetStrategy)) {
+            // 如果要从最早开始消费，使用唯一的consumer group
+            kafkaProps.setProperty("group.id", consumerGroupId);
+        } else {
+            // 如果要从最新开始消费，可以使用固定的consumer group
+            kafkaProps.setProperty("group.id", "flink-group");
+        }
+
         kafkaProps.setProperty("security.protocol", "SASL_PLAINTEXT");
         kafkaProps.setProperty("sasl.kerberos.service.name", "kafka");
         kafkaProps.setProperty("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
@@ -61,11 +74,27 @@ public class KafkaFlinkRedisMatchingJob {
         kafkaProps.setProperty("session.timeout.ms", "30000");
         kafkaProps.setProperty("heartbeat.interval.ms", "3000");
 
+        // 关闭自动提交offset，让Flink管理offset
+        kafkaProps.setProperty("enable.auto.commit", "false");
+
         FlinkKafkaConsumer<String> kafkaConsumer = new FlinkKafkaConsumer<>(
                 kafkaTopic,
                 new SimpleStringSchema(),
                 kafkaProps
         );
+
+        // 根据offsetResetStrategy设置起始位置
+        if ("earliest".equals(offsetResetStrategy)) {
+            kafkaConsumer.setStartFromEarliest();
+        } else if ("latest".equals(offsetResetStrategy)) {
+            kafkaConsumer.setStartFromLatest();
+        }
+
+        // 如果要强制从earliest开始，可以使用以下方式：
+        // kafkaConsumer.setStartFromGroupOffsets(); // 默认行为，从group offsets开始
+        // kafkaConsumer.setStartFromEarliest(); // 强制从最早开始
+        // kafkaConsumer.setStartFromLatest(); // 强制从最新开始
+        // kafkaConsumer.setStartFromTimestamp(timestamp); // 从指定时间戳开始
 
         DataStream<String> stream = env.addSource(kafkaConsumer)
                 .assignTimestampsAndWatermarks(WatermarkStrategy.noWatermarks());
@@ -74,6 +103,9 @@ public class KafkaFlinkRedisMatchingJob {
 
         parsedStream.keyBy(json -> json.get("msgId").asText())
                 .addSink(new RedisPairSink(redisNodes));
+
+        System.out.println("Starting Kafka to Redis Pairing Job with offset reset strategy: " + offsetResetStrategy);
+        System.out.println("Consumer group ID: " + kafkaProps.getProperty("group.id"));
 
         env.execute("Kafka to Redis Pairing Job");
     }
@@ -98,6 +130,7 @@ public class KafkaFlinkRedisMatchingJob {
                 }
             } catch (Exception e) {
                 // log and skip invalid json
+                System.err.println("Failed to parse JSON: " + value + ", error: " + e.getMessage());
             }
         }
     }

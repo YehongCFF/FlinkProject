@@ -37,18 +37,39 @@ public class KafkaFlinkStateMatchingJob {
 
         Properties kafkaProps = new Properties();
         kafkaProps.setProperty("bootstrap.servers", kafkaBrokers);
-        kafkaProps.setProperty("group.id", "flink-group");
+
+        // 根据offset策略动态设置consumer group ID
+        String consumerGroupId;
+        if ("earliest".equals(offsetResetStrategy)) {
+            // 使用时间戳创建唯一的consumer group，确保从最早开始消费
+            consumerGroupId = "flink-group-" + System.currentTimeMillis();
+        } else {
+            // 使用固定的consumer group
+            consumerGroupId = "flink-group";
+        }
+        kafkaProps.setProperty("group.id", consumerGroupId);
+
         kafkaProps.setProperty("security.protocol", "SASL_PLAINTEXT");
         kafkaProps.setProperty("sasl.kerberos.service.name", "kafka");
         kafkaProps.setProperty("key.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         kafkaProps.setProperty("value.deserializer", "org.apache.kafka.common.serialization.StringDeserializer");
         kafkaProps.setProperty("auto.offset.reset", offsetResetStrategy);
 
+        // 禁用自动提交offset，让Flink管理
+        kafkaProps.setProperty("enable.auto.commit", "false");
+
         FlinkKafkaConsumer<String> kafkaConsumer = new FlinkKafkaConsumer<>(
                 kafkaTopic,
                 new SimpleStringSchema(),
                 kafkaProps
         );
+
+        // 显式设置起始位置
+        if ("earliest".equals(offsetResetStrategy)) {
+            kafkaConsumer.setStartFromEarliest();
+        } else if ("latest".equals(offsetResetStrategy)) {
+            kafkaConsumer.setStartFromLatest();
+        }
 
         DataStream<String> stream = env.addSource(kafkaConsumer)
                 .assignTimestampsAndWatermarks(WatermarkStrategy.noWatermarks());
