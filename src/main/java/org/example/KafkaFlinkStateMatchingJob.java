@@ -8,6 +8,7 @@ import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.streaming.api.CheckpointingMode;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -34,6 +35,13 @@ public class KafkaFlinkStateMatchingJob {
         String offsetResetStrategy = args[2];
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
+
+        // 启用checkpoint，每30秒执行一次
+        env.enableCheckpointing(30000); // 30秒 = 30000毫秒
+        env.getCheckpointConfig().setCheckpointingMode(CheckpointingMode.EXACTLY_ONCE);
+        env.getCheckpointConfig().setMinPauseBetweenCheckpoints(5000); // 最小间隔5秒
+        env.getCheckpointConfig().setCheckpointTimeout(60000); // 超时时间60秒
+        env.getCheckpointConfig().setMaxConcurrentCheckpoints(1); // 最大并发checkpoint数量
 
         Properties kafkaProps = new Properties();
         kafkaProps.setProperty("bootstrap.servers", kafkaBrokers);
